@@ -2,280 +2,337 @@ package io.netty.channel.sharedmem;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.util.EnumSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Represents a memory-mapped shared memory region used by the SharedMem protocol.
- * <p>
- * Internally backed by a memory-mapped file (POSIX-style shm emulation). The region
- * is divided into a fixed header area and a circular ring buffer for message passing.
+ * Low-level shared-memory ring-buffer region.
  *
+ * <p>Backed by a {@link MappedByteBuffer} so it works cross-process on any OS
+ * without JNI for the initial implementation.  A native-backed version (e.g.
+ * using {@code shm_open} / {@code mmap} via JNI) can be swapped in by replacing
+ * only this class while keeping the rest of the API unchanged.
+ *
+ * <h3>Region layout (bytes)</h3>
  * <pre>
- * Region Layout:
- * ┌──────────────────────────────────────────────────┐
- * │  HEADER (64 bytes)                               │
- * │  [0..3]   magic number (0xSHMM)                 │
- * │  [4..7]   version                               │
- * │  [8..11]  write index (producer)                │
- * │  [12..15] read  index (consumer)                │
- * │  [16..19] region capacity (bytes)               │
- * │  [20..63] reserved                              │
- * ├──────────────────────────────────────────────────┤
- * │  DATA (capacity bytes - HEADER_SIZE bytes)       │
- * │  Circular ring buffer of framed messages         │
- * │  Each frame: [4-byte length][payload bytes]      │
- * └──────────────────────────────────────────────────┘
+ * Offset  Size  Field
+ * ──────  ────  ─────────────────────────────────────────────
+ *  0       4    Magic number  (0x53484D4D = ASCII "SHMM")
+ *  4       4    Version       (currently 1)
+ *  8       8    Write cursor  (monotonically increasing long, producer side)
+ * 16       8    Read  cursor  (monotonically increasing long, consumer side)
+ * 24       4    Capacity      (size of the circular data area in bytes)
+ * 28       4    Flags         (bit 0 = READY, bit 1 = CLOSED)
+ * 32      [cap] Circular data buffer
  * </pre>
+ *
+ * All multi-byte values are stored in the JVM's native byte order
+ * ({@link java.nio.ByteOrder#nativeOrder()}).  Cursors are monotonically
+ * increasing so modular arithmetic automatically handles wrap-around:
+ * {@code dataIndex = cursor % capacity}.
+ *
+ * <h3>Thread safety</h3>
+ * A single {@link SharedMemRegion} instance is <em>not</em> thread-safe.
+ * If multiple threads need to read or write concurrently, external
+ * synchronisation is required.  In the Netty integration each region
+ * is accessed exclusively from its owning event-loop thread.
  */
 public final class SharedMemRegion implements Closeable {
 
-    public static final int HEADER_SIZE       = 64;
-    public static final int MAGIC             = 0x53484D4D; // "SHMM"
-    public static final int VERSION           = 1;
-    public static final int FRAME_HEADER_SIZE = 4; // 4-byte message length prefix
+    // ─────────────────────────────────────────────────────────────────────────
+    // Public constants
+    // ─────────────────────────────────────────────────────────────────────────
 
-    // Header field offsets
-    private static final int OFF_MAGIC     = 0;
-    private static final int OFF_VERSION   = 4;
-    private static final int OFF_WRITE_IDX = 8;
-    private static final int OFF_READ_IDX  = 12;
-    private static final int OFF_CAPACITY  = 16;
+    /** Magic number stored in the first 4 bytes of every region: {@code "SHMM"}. */
+    public static final int  MAGIC       = 0x53484D4D;
 
-    private static final String SHM_DIR = System.getProperty("sharedmem.dir",
-            System.getProperty("java.io.tmpdir") + "/sharedmem");
+    /** Current wire-format version. */
+    public static final int  VERSION     = 1;
 
-    private final String regionName;
-    private final int    totalSize;   // including header
-    private final int    dataSize;    // ring buffer size = totalSize - HEADER_SIZE
+    /** Size in bytes of the fixed region header. */
+    public static final int  HEADER_SIZE = 32;
 
-    private RandomAccessFile  backingFile;
-    private FileChannel       fileChannel;
-    private MappedByteBuffer  mappedBuffer;
+    /** Flag bit indicating the region is initialised and ready to use. */
+    public static final int  FLAG_READY  = 0x01;
 
-    private final AtomicBoolean closed = new AtomicBoolean(false);
+    /** Flag bit indicating the region has been closed by its creator. */
+    public static final int  FLAG_CLOSED = 0x02;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Private header-field offsets
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static final int OFF_MAGIC      =  0;
+    private static final int OFF_VERSION    =  4;
+    private static final int OFF_WRITE_CUR  =  8;
+    private static final int OFF_READ_CUR   = 16;
+    private static final int OFF_CAPACITY   = 24;
+    private static final int OFF_FLAGS      = 28;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Instance state
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private final String          regionName;
+    private int                   capacity; // set from header when opening existing region
+    private final FileChannel     fileChannel;
+    private final MappedByteBuffer mapping;
+    private final AtomicBoolean   closed = new AtomicBoolean(false);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Constructors
+    // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Opens (or creates) a shared memory region.
+     * Opens or creates a shared-memory region.
      *
-     * @param regionName the unique name of the region
-     * @param capacity   total size in bytes (must be > HEADER_SIZE)
-     * @throws IOException if the backing file cannot be created or mapped
+     * @param regionName name of the region; used to derive the backing file path
+     * @param capacity   size of the circular data buffer in bytes; must be &gt; 0.
+     *                   Ignored (header value used instead) when {@code create} is {@code false}.
+     * @param create     {@code true} → create (or truncate) the backing file and write the header;
+     *                   {@code false} → open an existing region and validate the header
+     * @throws IOException              if the backing file cannot be opened or mapped
+     * @throws IllegalArgumentException if {@code capacity} is &le; 0
+     * @throws IllegalStateException    if {@code create=false} and the header magic is wrong
      */
-    public SharedMemRegion(String regionName, int capacity) throws IOException {
-        if (capacity <= HEADER_SIZE) {
-            throw new IllegalArgumentException("capacity must be > " + HEADER_SIZE);
+    public SharedMemRegion(String regionName, int capacity, boolean create) throws IOException {
+        if (capacity <= 0) {
+            throw new IllegalArgumentException("capacity must be > 0, got: " + capacity);
         }
         this.regionName = regionName;
-        this.totalSize  = capacity;
-        this.dataSize   = capacity - HEADER_SIZE;
+        this.capacity   = capacity;
 
-        Path shmDir = Paths.get(SHM_DIR);
-        if (!Files.exists(shmDir)) {
-            Files.createDirectories(shmDir);
-        }
+        Path   backingFile = resolveBackingFile(regionName);
+        long   totalSize   = (long) HEADER_SIZE + capacity;
 
-        Path shmFile = shmDir.resolve(regionName + ".shm");
-        boolean isNew = !Files.exists(shmFile);
-
-        backingFile  = new RandomAccessFile(shmFile.toFile(), "rw");
-        backingFile.setLength(totalSize);
-        fileChannel  = backingFile.getChannel();
-        mappedBuffer = fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, totalSize);
-        mappedBuffer.order(java.nio.ByteOrder.nativeOrder());
-
-        if (isNew) {
+        if (create) {
+            Files.createDirectories(backingFile.getParent());
+            this.fileChannel = FileChannel.open(backingFile,
+                    EnumSet.of(StandardOpenOption.READ,
+                            StandardOpenOption.WRITE,
+                            StandardOpenOption.CREATE,
+                            StandardOpenOption.TRUNCATE_EXISTING));
+            // Extend the file to the required size by writing a single byte at the end.
+            this.fileChannel.position(totalSize - 1);
+            this.fileChannel.write(ByteBuffer.wrap(new byte[]{ 0 }));
+            this.mapping = this.fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, totalSize);
             initHeader();
         } else {
+            this.fileChannel = FileChannel.open(backingFile,
+                    StandardOpenOption.READ, StandardOpenOption.WRITE);
+            long existingSize = this.fileChannel.size();
+            this.mapping = this.fileChannel.map(FileChannel.MapMode.READ_WRITE, 0, existingSize);
             validateHeader();
+            // Read the actual capacity from the header — the constructor arg is only a hint
+            // when opening an existing region. The file's header value is authoritative.
+            this.capacity = this.mapping.getInt(OFF_CAPACITY);
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Header helpers
-    // -------------------------------------------------------------------------
-
-    private void initHeader() {
-        mappedBuffer.putInt(OFF_MAGIC,     MAGIC);
-        mappedBuffer.putInt(OFF_VERSION,   VERSION);
-        mappedBuffer.putInt(OFF_WRITE_IDX, 0);
-        mappedBuffer.putInt(OFF_READ_IDX,  0);
-        mappedBuffer.putInt(OFF_CAPACITY,  dataSize);
-        mappedBuffer.force();
-    }
-
-    private void validateHeader() {
-        int magic = mappedBuffer.getInt(OFF_MAGIC);
-        if (magic != MAGIC) {
-            throw new IllegalStateException(
-                    String.format("Invalid SharedMem magic: expected 0x%X, got 0x%X", MAGIC, magic));
-        }
-    }
-
-    private int getWriteIndex() { return mappedBuffer.getInt(OFF_WRITE_IDX); }
-    private int getReadIndex()  { return mappedBuffer.getInt(OFF_READ_IDX);  }
-    private void setWriteIndex(int idx) { mappedBuffer.putInt(OFF_WRITE_IDX, idx); }
-    private void setReadIndex(int idx)  { mappedBuffer.putInt(OFF_READ_IDX,  idx); }
-
-    /** Converts a ring offset to an absolute buffer position. */
-    private int dataOffset(int ringIndex) {
-        return HEADER_SIZE + (ringIndex % dataSize);
-    }
-
-    // -------------------------------------------------------------------------
-    // Write path  (producer)
-    // -------------------------------------------------------------------------
+    // ─────────────────────────────────────────────────────────────────────────
+    // Public API – read / write
+    // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Writes a framed message into the ring buffer.
+     * Writes up to {@code length} bytes from {@code src} (starting at {@code offset})
+     * into the circular buffer.
      *
-     * @param src    source buffer (position to limit will be written)
-     * @return {@code true} if the message was written; {@code false} if the ring is full
+     * <p>If the ring is too full to accept all {@code length} bytes, only the bytes
+     * that fit are written.  The caller is responsible for retrying any unwritten remainder.
+     *
+     * @param src    source byte array
+     * @param offset starting index in {@code src}
+     * @param length number of bytes to attempt to write
+     * @return number of bytes actually written ({@code 0} if the ring is full)
+     * @throws IllegalStateException if the region has been closed
      */
-    public boolean write(ByteBuffer src) {
-        checkOpen();
-        int msgLen   = src.remaining();
-        int frameLen = FRAME_HEADER_SIZE + msgLen;
+    public int write(byte[] src, int offset, int length) {
+        ensureOpen();
+        long writeCursor = readLong(OFF_WRITE_CUR);
+        long readCursor  = readLong(OFF_READ_CUR);
+        int  used        = (int) (writeCursor - readCursor);
+        int  available   = capacity - used;
+        int  toWrite     = Math.min(length, available);
+        if (toWrite <= 0) return 0;
 
-        int writeIdx = getWriteIndex();
-        int readIdx  = getReadIndex();
-        int used     = (writeIdx - readIdx + dataSize) % dataSize;
-        int free     = dataSize - used - 1;
-
-        if (frameLen > free) {
-            return false; // ring full
+        int startPos = (int) (writeCursor % capacity);
+        for (int i = 0; i < toWrite; i++) {
+            int index = (startPos + i) % capacity;
+            mapping.put(HEADER_SIZE + index, src[offset + i]);
         }
-
-        // Write 4-byte length prefix
-        writeRingInt(writeIdx, msgLen);
-        writeIdx = advance(writeIdx, FRAME_HEADER_SIZE);
-
-        // Write payload (handles wrap-around)
-        int srcStart = src.position();
-        int remaining = msgLen;
-        while (remaining > 0) {
-            int absPos  = dataOffset(writeIdx);
-            int canWrite = Math.min(remaining, dataSize - (writeIdx % dataSize));
-            for (int i = 0; i < canWrite; i++) {
-                mappedBuffer.put(absPos + i, src.get(srcStart + (msgLen - remaining) + i));
-            }
-            remaining -= canWrite;
-            writeIdx   = advance(writeIdx, canWrite);
-        }
-
-        setWriteIndex(writeIdx);
-        mappedBuffer.force();
-        return true;
+        writeLong(OFF_WRITE_CUR, writeCursor + toWrite);
+        mapping.force();
+        return toWrite;
     }
-
-    private void writeRingInt(int ringIndex, int value) {
-        byte[] bytes = new byte[] {
-            (byte)(value >>> 24),
-            (byte)(value >>> 16),
-            (byte)(value >>>  8),
-            (byte)(value)
-        };
-        for (int i = 0; i < 4; i++) {
-            mappedBuffer.put(dataOffset(ringIndex + i), bytes[i]);
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Read path (consumer)
-    // -------------------------------------------------------------------------
 
     /**
-     * Reads the next framed message from the ring buffer into {@code dst}.
+     * Reads up to {@code maxLength} bytes from the circular buffer into {@code dst}
+     * (starting at {@code offset}).
      *
-     * @param dst destination buffer; must have enough remaining space
-     * @return number of bytes read, or -1 if the ring is empty
+     * @param dst       destination byte array
+     * @param offset    starting index in {@code dst}
+     * @param maxLength maximum number of bytes to read
+     * @return number of bytes actually read ({@code 0} if the ring is empty)
+     * @throws IllegalStateException if the region has been closed
      */
-    public int read(ByteBuffer dst) {
-        checkOpen();
-        int writeIdx = getWriteIndex();
-        int readIdx  = getReadIndex();
+    public int read(byte[] dst, int offset, int maxLength) {
+        ensureOpen();
+        long writeCursor = readLong(OFF_WRITE_CUR);
+        long readCursor  = readLong(OFF_READ_CUR);
+        int  available   = (int) (writeCursor - readCursor);
+        int  toRead      = Math.min(maxLength, available);
+        if (toRead <= 0) return 0;
 
-        if (readIdx == writeIdx) {
-            return -1; // ring empty
+        int startPos = (int) (readCursor % capacity);
+        for (int i = 0; i < toRead; i++) {
+            int index = (startPos + i) % capacity;
+            dst[offset + i] = mapping.get(HEADER_SIZE + index);
         }
-
-        // Read 4-byte length prefix
-        int msgLen = readRingInt(readIdx);
-        readIdx = advance(readIdx, FRAME_HEADER_SIZE);
-
-        if (msgLen > dst.remaining()) {
-            // Caller's buffer is too small — skip the message
-            readIdx = advance(readIdx, msgLen);
-            setReadIndex(readIdx);
-            return 0;
-        }
-
-        // Read payload
-        int dstStart  = dst.position();
-        int remaining = msgLen;
-        while (remaining > 0) {
-            int absPos   = dataOffset(readIdx);
-            int canRead  = Math.min(remaining, dataSize - (readIdx % dataSize));
-            for (int i = 0; i < canRead; i++) {
-                dst.put(dstStart + (msgLen - remaining) + i, mappedBuffer.get(absPos + i));
-            }
-            remaining -= canRead;
-            readIdx    = advance(readIdx, canRead);
-        }
-        dst.position(dstStart + msgLen);
-        dst.limit(dstStart + msgLen);
-
-        setReadIndex(readIdx);
-        return msgLen;
+        writeLong(OFF_READ_CUR, readCursor + toRead);
+        mapping.force();
+        return toRead;
     }
 
-    private int readRingInt(int ringIndex) {
-        int b0 = mappedBuffer.get(dataOffset(ringIndex))     & 0xFF;
-        int b1 = mappedBuffer.get(dataOffset(ringIndex + 1)) & 0xFF;
-        int b2 = mappedBuffer.get(dataOffset(ringIndex + 2)) & 0xFF;
-        int b3 = mappedBuffer.get(dataOffset(ringIndex + 3)) & 0xFF;
-        return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    // ─────────────────────────────────────────────────────────────────────────
+    // Public API – introspection
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Returns the number of bytes currently available to read from the ring buffer.
+     */
+    public int readableBytes() {
+        ensureOpen();
+        return (int) (readLong(OFF_WRITE_CUR) - readLong(OFF_READ_CUR));
     }
 
-    /** Returns true if the ring buffer has at least one message ready to read. */
-    public boolean isReadable() {
-        return getReadIndex() != getWriteIndex();
+    /**
+     * Returns the number of bytes that can still be written to the ring buffer
+     * without blocking.
+     */
+    public int writableBytes() {
+        return capacity - readableBytes();
     }
 
-    // -------------------------------------------------------------------------
-    // Utility
-    // -------------------------------------------------------------------------
-
-    private int advance(int index, int by) {
-        return (index + by) % dataSize;
+    /**
+     * Returns the name of this shared-memory region.
+     */
+    public String getRegionName() {
+        return regionName;
     }
 
-    public String getRegionName() { return regionName; }
-    public int    getDataSize()   { return dataSize; }
-    public int    getTotalSize()  { return totalSize; }
-
-    private void checkOpen() {
-        if (closed.get()) {
-            throw new IllegalStateException("SharedMemRegion [" + regionName + "] is closed");
-        }
+    /**
+     * Returns the capacity (size of the data area) of the ring buffer in bytes.
+     */
+    public int getCapacity() {
+        return capacity;
     }
 
+    /**
+     * Returns {@code true} if this region has been closed.
+     */
+    public boolean isClosed() {
+        return closed.get();
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Closeable
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Marks the region as closed (sets {@link #FLAG_CLOSED} in the header),
+     * forces pending writes to the backing file, and releases the file channel.
+     *
+     * <p>Idempotent – calling {@code close()} multiple times is safe.
+     *
+     * @throws IOException if an I/O error occurs while releasing resources
+     */
     @Override
     public void close() throws IOException {
         if (closed.compareAndSet(false, true)) {
-            if (fileChannel != null) fileChannel.close();
-            if (backingFile != null) backingFile.close();
+            writeInt(OFF_FLAGS, readInt(OFF_FLAGS) | FLAG_CLOSED);
+            mapping.force();
+            fileChannel.close();
         }
     }
 
-    @Override
-    public String toString() {
-        return "SharedMemRegion{name='" + regionName + "', totalSize=" + totalSize + '}';
+    // ─────────────────────────────────────────────────────────────────────────
+    // Internal helpers – header I/O
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private void initHeader() {
+        writeInt(OFF_MAGIC,    MAGIC);
+        writeInt(OFF_VERSION,  VERSION);
+        writeLong(OFF_WRITE_CUR, 0L);
+        writeLong(OFF_READ_CUR,  0L);
+        writeInt(OFF_CAPACITY, capacity);
+        writeInt(OFF_FLAGS,    FLAG_READY);
+        mapping.force();
+    }
+
+    private void validateHeader() {
+        int magic = readInt(OFF_MAGIC);
+        if (magic != MAGIC) {
+            throw new IllegalStateException(String.format(
+                    "Invalid SharedMem region '%s': expected magic 0x%08X, found 0x%08X",
+                    regionName, MAGIC, magic));
+        }
+        int version = readInt(OFF_VERSION);
+        if (version != VERSION) {
+            throw new IllegalStateException(String.format(
+                    "Unsupported SharedMem region version: %d (supported: %d)", version, VERSION));
+        }
+    }
+
+    private void ensureOpen() {
+        if (closed.get()) {
+            throw new IllegalStateException("SharedMemRegion '" + regionName + "' is already closed");
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Internal helpers – MappedByteBuffer accessors
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private int readInt(int offset) {
+        return mapping.getInt(offset);
+    }
+
+    private void writeInt(int offset, int value) {
+        mapping.putInt(offset, value);
+    }
+
+    private long readLong(int offset) {
+        return mapping.getLong(offset);
+    }
+
+    private void writeLong(int offset, long value) {
+        mapping.putLong(offset, value);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Backing-file path resolution
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Resolves the file-system path for the backing file of a named region.
+     *
+     * <p>The directory can be overridden via the {@code sharedmem.dir} system property.
+     * Defaults to {@code $TMPDIR/sharedmem/}.
+     *
+     * @param regionName region identifier
+     * @return absolute path to the {@code .shm} file
+     */
+    static Path resolveBackingFile(String regionName) {
+        String baseDir = System.getProperty(
+                "sharedmem.dir",
+                System.getProperty("java.io.tmpdir") + "/sharedmem");
+        return Paths.get(baseDir, regionName + ".shm");
     }
 }

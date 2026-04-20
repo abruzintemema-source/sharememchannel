@@ -158,19 +158,19 @@ public final class SharedMemEventLoop extends SingleThreadEventLoop {
                 continue;
             }
             try {
-                int n = 0;
                 if (ch instanceof SharedMemServerChannel) {
                     SharedMemServerChannel server = (SharedMemServerChannel) ch;
                     if (server.hasReadableData()) {
-                        n = server.doReadMessages();
+                        hadData = true;
+                        server.pollAccept();
                     }
                 } else if (ch instanceof SharedMemChannel) {
                     SharedMemChannel data = (SharedMemChannel) ch;
                     if (data.hasReadableData()) {
-                        n = data.doReadMessages();
+                        hadData = true;
+                        data.pollRead();
                     }
                 }
-                if (n > 0) hadData = true;
             } catch (Throwable t) {
                 LOG.warn("Exception while polling channel {}", ch, t);
                 try {

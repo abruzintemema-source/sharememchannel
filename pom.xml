@@ -65,6 +65,9 @@
     </dependencies>
 
     <build>
+        <!-- Compile everything under src/main/java regardless of package -->
+        <sourceDirectory>src/main/java</sourceDirectory>
+        <testSourceDirectory>src/test/java</testSourceDirectory>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -73,6 +76,11 @@
                 <configuration>
                     <source>${java.version}</source>
                     <target>${java.version}</target>
+                    <encoding>UTF-8</encoding>
+                    <!-- Include every .java file under src/main/java -->
+                    <includes>
+                        <include>**/*.java</include>
+                    </includes>
                 </configuration>
             </plugin>
             <plugin>
@@ -86,9 +94,12 @@
                 <version>3.3.0</version>
                 <configuration>
                     <archive>
-                        <manifestEntries>
-                            <Automatic-Module-Name>io.netty.transport.sharedmem</Automatic-Module-Name>
-                        </manifestEntries>
+                        <manifest>
+                            <addClasspath>true</addClasspath>
+                            <mainClass>
+                                io.netty.channel.sharedmem.example.SharedMemEchoServer
+                            </mainClass>
+                        </manifest>
                     </archive>
                 </configuration>
             </plugin>

@@ -6,8 +6,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.nio.file.Path;
+import java.util.Arrays;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -23,9 +23,8 @@ class SharedMemRegionTest {
 
     @BeforeEach
     void setUp() throws IOException {
-        // Point shm dir at JUnit's temp directory
         System.setProperty("sharedmem.dir", tempDir.toAbsolutePath().toString());
-        region = new SharedMemRegion("test_region", 64 * 1024); // 64 KB
+        region = new SharedMemRegion("test_region", 64 * 1024, true);
     }
 
     @AfterEach
@@ -35,94 +34,107 @@ class SharedMemRegionTest {
 
     @Test
     void testWriteAndRead() throws IOException {
-        byte[] data    = "Hello, SharedMem!".getBytes();
-        ByteBuffer src = ByteBuffer.wrap(data);
-        ByteBuffer dst = ByteBuffer.allocate(1024);
+        byte[] data = "Hello, SharedMem!".getBytes();
+        int written = region.write(data, 0, data.length);
+        assertEquals(data.length, written);
 
-        assertTrue(region.write(src), "write should succeed");
-
-        dst.clear();
-        int n = region.read(dst);
-
-        assertEquals(data.length, n, "read byte count mismatch");
-        dst.position(0);
-        byte[] result = new byte[n];
-        dst.get(result);
-        assertArrayEquals(data, result);
+        byte[] dst = new byte[data.length];
+        int read = region.read(dst, 0, dst.length);
+        assertEquals(data.length, read);
+        assertArrayEquals(data, dst);
     }
 
     @Test
     void testMultipleMessages() throws IOException {
         String[] messages = {"alpha", "beta", "gamma", "delta"};
-
         for (String m : messages) {
-            ByteBuffer src = ByteBuffer.wrap(m.getBytes());
-            assertTrue(region.write(src));
+            byte[] bytes = m.getBytes();
+            assertEquals(bytes.length, region.write(bytes, 0, bytes.length));
         }
 
+        // All writes are raw bytes — concatenated in the ring; read them back sequentially
         for (String expected : messages) {
-            ByteBuffer dst = ByteBuffer.allocate(256);
-            int n = region.read(dst);
-            assertTrue(n > 0);
-            dst.position(0);
-            byte[] bytes = new byte[n];
-            dst.get(bytes);
-            assertEquals(expected, new String(bytes));
+            byte[] dst = new byte[expected.length()];
+            int n = region.read(dst, 0, dst.length);
+            assertEquals(expected.length(), n);
+            assertEquals(expected, new String(dst));
         }
     }
 
     @Test
-    void testEmptyReadReturnsNegativeOne() throws IOException {
-        ByteBuffer dst = ByteBuffer.allocate(256);
-        int n = region.read(dst);
-        assertEquals(-1, n, "empty ring should return -1");
+    void testEmptyReadReturnsZero() throws IOException {
+        byte[] dst = new byte[256];
+        int n = region.read(dst, 0, dst.length);
+        assertEquals(0, n, "empty ring should return 0");
     }
 
     @Test
-    void testIsReadable() throws IOException {
-        assertFalse(region.isReadable(), "should not be readable when empty");
+    void testReadableBytes() throws IOException {
+        assertEquals(0, region.readableBytes(), "should be 0 when empty");
 
-        ByteBuffer src = ByteBuffer.wrap("ping".getBytes());
-        region.write(src);
+        byte[] data = "ping".getBytes();
+        region.write(data, 0, data.length);
+        assertEquals(data.length, region.readableBytes());
 
-        assertTrue(region.isReadable(), "should be readable after write");
-
-        ByteBuffer dst = ByteBuffer.allocate(256);
-        region.read(dst);
-
-        assertFalse(region.isReadable(), "should not be readable after full drain");
+        byte[] dst = new byte[data.length];
+        region.read(dst, 0, dst.length);
+        assertEquals(0, region.readableBytes(), "should be 0 after full drain");
     }
 
     @Test
     void testWrapAround() throws IOException {
-        // Fill ring close to capacity, then drain, then write again to exercise wrap-around
-        int dataSize = region.getDataSize();
-        int msgLen   = dataSize / 4 - SharedMemRegion.FRAME_HEADER_SIZE;
+        int capacity = region.getCapacity();
+        int msgLen = capacity / 4;
         byte[] payload = new byte[msgLen];
-        java.util.Arrays.fill(payload, (byte) 0x42);
+        Arrays.fill(payload, (byte) 0x42);
 
+        // Write 3 messages, drain them, then write 3 more to exercise wrap-around
         for (int i = 0; i < 3; i++) {
-            region.write(ByteBuffer.wrap(payload));
+            assertEquals(msgLen, region.write(payload, 0, msgLen));
         }
         for (int i = 0; i < 3; i++) {
-            ByteBuffer dst = ByteBuffer.allocate(msgLen + 8);
-            region.read(dst);
-        }
-        // Ring head is now near mid-buffer — next write should wrap around
-        for (int i = 0; i < 3; i++) {
-            assertTrue(region.write(ByteBuffer.wrap(payload)), "wrap-around write " + i);
+            byte[] dst = new byte[msgLen];
+            region.read(dst, 0, msgLen);
         }
         for (int i = 0; i < 3; i++) {
-            ByteBuffer dst = ByteBuffer.allocate(msgLen + 8);
-            int n = region.read(dst);
+            assertEquals(msgLen, region.write(payload, 0, msgLen), "wrap-around write " + i);
+        }
+        for (int i = 0; i < 3; i++) {
+            byte[] dst = new byte[msgLen];
+            int n = region.read(dst, 0, msgLen);
             assertEquals(msgLen, n, "wrap-around read " + i);
         }
+    }
+
+    @Test
+    void testRingFullReturnsPartial() throws IOException {
+        int capacity = region.getCapacity();
+        byte[] bigPayload = new byte[capacity];
+        Arrays.fill(bigPayload, (byte) 0x55);
+        // Ring is full after this — write returns less than requested on overflow
+        int written = region.write(bigPayload, 0, bigPayload.length);
+        assertTrue(written > 0 && written <= capacity);
+        assertEquals(0, region.writableBytes());
     }
 
     @Test
     void testClosedRegionThrows() throws IOException {
         region.close();
         assertThrows(IllegalStateException.class, () ->
-                region.write(ByteBuffer.wrap("x".getBytes())));
+                region.write("x".getBytes(), 0, 1));
+    }
+
+    @Test
+    void testOpenExistingRegion() throws IOException {
+        byte[] data = "persist".getBytes();
+        region.write(data, 0, data.length);
+        region.close();
+
+        try (SharedMemRegion reopened = new SharedMemRegion("test_region", 1, false)) {
+            assertEquals(data.length, reopened.readableBytes());
+            byte[] dst = new byte[data.length];
+            reopened.read(dst, 0, dst.length);
+            assertArrayEquals(data, dst);
+        }
     }
 }

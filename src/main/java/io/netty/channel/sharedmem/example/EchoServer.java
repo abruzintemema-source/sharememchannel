@@ -62,7 +62,7 @@ public final class EchoServer {
 
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
-            System.out.println("[EchoServer] Client connected: " + ctx.channel().remoteAddress());
+            System.out.println("[EchoServer]  channelActive: " + ctx.channel().remoteAddress());
         }
 
         @Override
