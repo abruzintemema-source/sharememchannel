@@ -1,11 +1,17 @@
 package io.netty.channel.sharedmem.example;
 
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelPipeline;
+
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import io.netty.channel.sharedmem.SharedMemAddress;
 import io.netty.channel.sharedmem.SharedMemChannel;
 import io.netty.channel.sharedmem.SharedMemChannelOption;
@@ -60,6 +66,9 @@ public final class EchoServer {
 
     private static final class EchoServerHandler extends ChannelInboundHandlerAdapter {
 
+        private static final DateTimeFormatter FMT =
+                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
+
         @Override
         public void channelActive(ChannelHandlerContext ctx) {
             System.out.println("[EchoServer]  channelActive: " + ctx.channel().remoteAddress());
@@ -67,7 +76,17 @@ public final class EchoServer {
 
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) {
-            ctx.writeAndFlush(msg);
+            ByteBuf in = (ByteBuf) msg;
+            try {
+                String received = in.toString(StandardCharsets.UTF_8);
+                String timestamp = LocalDateTime.now().format(FMT);
+                System.out.println("[EchoServer]  Received: " + received);
+                System.out.println("[EchoServer]  Echoing at: " + timestamp);
+                String reply = received + " over " + timestamp;
+                ctx.writeAndFlush(Unpooled.copiedBuffer(reply, StandardCharsets.UTF_8));
+            } finally {
+                in.release();
+            }
         }
 
         @Override

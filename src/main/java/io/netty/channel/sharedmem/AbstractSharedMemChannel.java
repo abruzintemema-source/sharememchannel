@@ -7,8 +7,6 @@ import io.netty.channel.ChannelMetadata;
 import io.netty.channel.ChannelOutboundBuffer;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.EventLoop;
-import io.netty.util.internal.logging.InternalLogger;
-import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.net.SocketAddress;
 
@@ -16,9 +14,6 @@ import java.net.SocketAddress;
  * Abstract base class for SharedMem channels.
  */
 public abstract class AbstractSharedMemChannel extends AbstractChannel {
-
-    private static final InternalLogger LOG =
-            InternalLoggerFactory.getInstance(AbstractSharedMemChannel.class);
 
     protected static final ChannelMetadata METADATA = new ChannelMetadata(false);
 
@@ -123,21 +118,8 @@ public abstract class AbstractSharedMemChannel extends AbstractChannel {
             int available = rx.readableBytes();
             if (available <= 0) break;
             byte[] bytes = new byte[available];
-
-            StringBuilder sb = new StringBuilder();
-            for (byte b : bytes) {
-                sb.append(String.format("0x%02X ", b));
-            }
-            LOG.info("Read {} bytes from {}", messagesRead, sb);
-
             int read = rx.read(bytes, 0, available);
             if (read <= 0) break;
-
-            // trick thing,
-            // Force the last 3rd byte to 0
-            //bytes[bytes.length - 3] = 0;
-
-
             ByteBuf buf = config().getAllocator().buffer(read);
             buf.writeBytes(bytes, 0, read);
             pipeline().fireChannelRead(buf);

@@ -61,8 +61,10 @@ public final class EchoClient {
             System.out.println("[EchoClient] Connected to sharedmem://" + SERVER_REGION);
 
             // Send a test message
-            byte[] payload = "Hello, SharedMem!".getBytes(StandardCharsets.UTF_8);
-            f.channel().writeAndFlush(Unpooled.wrappedBuffer(payload));
+            String message = "Hello, SharedMem!";
+            System.out.println("[EchoClient] Sent:     " + message);
+            f.channel().writeAndFlush(
+                    Unpooled.copiedBuffer(message, StandardCharsets.UTF_8));
 
             // Wait a bit then close
             Thread.sleep(3000);
@@ -84,7 +86,7 @@ public final class EchoClient {
             io.netty.buffer.ByteBuf buf = (io.netty.buffer.ByteBuf) msg;
             try {
                 String reply = buf.toString(StandardCharsets.UTF_8);
-                System.out.println("[EchoClient] Received echo: " + reply);
+                System.out.println("[EchoClient] Received: " + reply);
             } finally {
                 buf.release();
             }

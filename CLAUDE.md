@@ -79,6 +79,3 @@ Cursors are monotonically increasing; `dataIndex = cursor % capacity`. Values us
 - The server never creates data regions — only the client does
 - `LoggingHandler` in `src/main/java/io/netty/handler/logging/` is a local copy, not from this project
 
-### Known Issue: Test/Implementation Mismatch
-
-`SharedMemRegionTest` uses a `ByteBuffer`-based API (`write(ByteBuffer)`, `read(ByteBuffer)`, `isReadable()`, `getDataSize()`, `FRAME_HEADER_SIZE`) that does not match the current `SharedMemRegion` implementation, which exposes a `write(byte[], int, int)` / `read(byte[], int, int)` API. The tests will not compile against the current code and need to be updated to match the implementation.
