@@ -8,11 +8,10 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelPipeline;
-
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import io.netty.channel.sharedmem.SharedMemAddress;
 import io.netty.channel.sharedmem.SharedMemChannel;
 import io.netty.channel.sharedmem.SharedMemChannelOption;
 import io.netty.channel.sharedmem.SharedMemEventLoopGroup;
@@ -32,7 +31,8 @@ import io.netty.handler.logging.LoggingHandler;
 public final class EchoServer {
 
     private static final int    REGION_SIZE = 8 * 1024 * 1024;
-    private static final String REGION_NAME = "echo_server";
+    private static final String HOST = "localhost";
+    private static final int PORT = 9000;
 
     public static void main(String[] args) throws InterruptedException {
         SharedMemEventLoopGroup bossGroup   = new SharedMemEventLoopGroup(1);
@@ -55,8 +55,8 @@ public final class EchoServer {
                         }
                     });
 
-            ChannelFuture f = b.bind(new SharedMemAddress(REGION_NAME)).sync();
-            System.out.println("[EchoServer] Listening on sharedmem://" + REGION_NAME);
+            ChannelFuture f = b.bind(new InetSocketAddress(HOST, PORT)).sync();
+            System.out.println("[EchoServer] Listening on " + HOST + ":" + PORT + " via SharedMemServerChannel");
             f.channel().closeFuture().sync();
         } finally {
             bossGroup.shutdownGracefully();
