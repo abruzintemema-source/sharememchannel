@@ -4,11 +4,11 @@ import java.net.SocketAddress;
 import java.util.Objects;
 
 /**
- * A {@link SocketAddress} implementation representing a SharedMem protocol endpoint.
- * <p>
- * A SharedMem address is identified by a region name (the shared memory segment key)
- * and an optional node identifier for multi-node topologies.
+ * @deprecated Shared-memory transport now uses standard {@link java.net.InetSocketAddress}
+ *             for endpoint addressing. Keep this class only for backward compatibility
+ *             with legacy integrations. Spark plugin path is InetSocketAddress-only.
  */
+@Deprecated
 public final class SharedMemAddress extends SocketAddress {
 
     private static final long serialVersionUID = 1L;
