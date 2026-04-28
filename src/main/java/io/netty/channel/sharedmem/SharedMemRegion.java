@@ -200,6 +200,39 @@ public final class SharedMemRegion implements Closeable {
         return toRead;
     }
 
+    public ByteBuffer readAsByteBuffer(int length) {
+    ensureOpen();
+
+    long writeCursor = readLong(OFF_WRITE_CUR);
+    long readCursor  = readLong(OFF_READ_CUR);
+
+    int available = (int) (writeCursor - readCursor);
+    int toRead    = Math.min(length, available);
+
+    if (toRead <= 0) {
+        return ByteBuffer.allocate(0);
+    }
+
+    int startPos = (int) (readCursor % capacity);
+
+    // ⚠️ Handle wrap-around
+    if (startPos + toRead <= capacity) {
+        // ✅ contiguous → true zero-copy slice
+        ByteBuffer dup = mapping.duplicate();
+        dup.position(HEADER_SIZE + startPos);
+        dup.limit(HEADER_SIZE + startPos + toRead);
+
+        ByteBuffer slice = dup.slice();
+
+        writeLong(OFF_READ_CUR, readCursor + toRead);
+        return slice;
+    } else {
+        // ❌ wrap-around → fallback (temporary copy)
+        byte[] tmp = new byte[toRead];
+        read(tmp, 0, toRead);
+        return ByteBuffer.wrap(tmp);
+    }
+}
     // ─────────────────────────────────────────────────────────────────────────
     // Public API – introspection
     // ─────────────────────────────────────────────────────────────────────────
@@ -217,9 +250,12 @@ public final class SharedMemRegion implements Closeable {
      * without blocking.
      */
     public int writableBytes() {
-        return capacity - readableBytes();
-    }
+        long writeCursor = readLong(OFF_WRITE_CUR);
+        long readCursor  = readLong(OFF_READ_CUR);
 
+        int used = (int)(writeCursor - readCursor);
+        return capacity - used;
+    }
     /**
      * Returns the name of this shared-memory region.
      */
