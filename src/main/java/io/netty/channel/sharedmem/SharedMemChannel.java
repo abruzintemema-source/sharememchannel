@@ -112,29 +112,34 @@ public class SharedMemChannel extends AbstractSharedMemChannel {
      */
     @Override
     protected void doConnect(SocketAddress remoteAddr, SocketAddress localAddr) throws Exception {
-        SharedMemAddress remote = requireSharedMemAddress(remoteAddr, "remoteAddress");
+        java.net.InetSocketAddress remote = (java.net.InetSocketAddress) remoteAddr;
 
-        // ── Step 1: derive local address ─────────────────────────────────────
-        int clientPort = (localAddr instanceof SharedMemAddress)
-                ? ((SharedMemAddress) localAddr).getNodeId()
+        String host = remote.getHostString();
+        int port = remote.getPort();
+
+        // 🔥 Map socket → shared memory namespace
+        String serverRegion = host + "_" + port;
+
+        // client id
+        int clientPort = (localAddr instanceof java.net.InetSocketAddress)
+                ? ((java.net.InetSocketAddress) localAddr).getPort()
                 : 0;
 
-        // ── Step 2: generate a unique data-region name for this connection ───
-        //    Format: <serverRegion>_<clientPort>_<uuid-short>
-        //    This guarantees no two connections collide, even on the same machine.
-        String uniqueDataRegion = remote.getRegionName()
+        // unique connection region
+        String uniqueDataRegion = serverRegion
                 + "_" + clientPort
                 + "_" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
 
+        // IMPORTANT: keep original socket addresses for Spark compatibility
         this.remoteAddress = remote;
-        this.localAddress  = new SharedMemAddress(uniqueDataRegion, clientPort);
+        this.localAddress  = new java.net.InetSocketAddress(host, clientPort);
 
         // ── Step 3: create the client→server tx region (client writes) ──────
         int capacity = config.getRegionSize();
         this.txRegion = new SharedMemRegion(uniqueDataRegion, capacity, true);
 
         // ── Step 4: open the server's CQ region and post the token ───────────
-        String cqName = SharedMemServerChannel.cqRegionName(remote);
+        String cqName = serverRegion + ".cq";
         SharedMemRegion cqRegion = null;
         try {
             cqRegion = new SharedMemRegion(cqName, 1, false);
@@ -204,7 +209,9 @@ public class SharedMemChannel extends AbstractSharedMemChannel {
     private SharedMemRegion waitForS2CRegion(String name, int capacity) throws IOException {
         java.nio.file.Path path = SharedMemRegion.resolveBackingFile(name);
         long deadline = System.nanoTime() + 5_000_000_000L; // 5s
+        System.out.println("🔥 Waiting for S2C region: " + name);
         while (System.nanoTime() < deadline) {
+            System.out.println("🔥 polling S2C...");
             if (Files.exists(path)) {
                 return new SharedMemRegion(name, capacity, false);
             }
@@ -238,12 +245,29 @@ public class SharedMemChannel extends AbstractSharedMemChannel {
     // Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    private static SharedMemAddress requireSharedMemAddress(SocketAddress addr, String name) {
-        if (addr instanceof SharedMemAddress) {
-            return (SharedMemAddress) addr;
-        }
-        throw new IllegalArgumentException(
-                name + " must be a SharedMemAddress, got: " +
-                        (addr == null ? "null" : addr.getClass().getName()));
+    // private static SharedMemAddress requireSharedMemAddress(SocketAddress addr, String name) {
+    //     if (addr instanceof SharedMemAddress) {
+    //         return (SharedMemAddress) addr;
+    //     }
+    //     throw new IllegalArgumentException(
+    //             name + " must be a SharedMemAddress, got: " +
+    //                     (addr == null ? "null" : addr.getClass().getName()));
+    // }
+    @Override
+    protected SocketAddress localAddress0() {
+        return localAddress;
+    }
+
+    @Override
+    protected SocketAddress remoteAddress0() {
+        return remoteAddress;
+    }
+
+    public SharedMemRegion getTxRegion() {
+        return txRegion;
+    }
+
+    public SharedMemRegion getRxRegion() {
+        return rxRegion;
     }
 }
