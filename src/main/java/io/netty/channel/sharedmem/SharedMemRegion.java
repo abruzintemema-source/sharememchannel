@@ -5,6 +5,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
+import java.lang.invoke.VarHandle;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -43,6 +44,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * If multiple threads need to read or write concurrently, external
  * synchronisation is required.  In the Netty integration each region
  * is accessed exclusively from its owning event-loop thread.
+ *  *
+ * <h3>Memory visibility assumptions (IPC)</h3>
+ * This transport assumes a single producer / single consumer pattern where:
+ * <ul>
+ *   <li>The producer writes payload bytes first and then publishes {@code writeCursor}.</li>
+ *   <li>The consumer reads {@code writeCursor}, then reads payload bytes, then publishes {@code readCursor}.</li>
+ * </ul>
+ * {@link VarHandle#releaseFence()} and {@link VarHandle#acquireFence()} are used around cursor publication/consumption
+ * so cursor updates act as publish points for ring data visibility across threads/processes that map the same region.
+ * Durability (persisting dirty pages to storage) is intentionally decoupled from visibility.
  */
 public final class SharedMemRegion implements Closeable {
 
@@ -84,6 +95,9 @@ public final class SharedMemRegion implements Closeable {
     private int                   capacity; // set from header when opening existing region
     private final FileChannel     fileChannel;
     private final MappedByteBuffer mapping;
+    private final boolean         forceOnClose;
+    private final int             flushEveryOps;
+    private int                   operationCountSinceFlush;
     private final AtomicBoolean   closed = new AtomicBoolean(false);
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -98,16 +112,39 @@ public final class SharedMemRegion implements Closeable {
      *                   Ignored (header value used instead) when {@code create} is {@code false}.
      * @param create     {@code true} → create (or truncate) the backing file and write the header;
      *                   {@code false} → open an existing region and validate the header
+     * 
+     * <p>Flush policy is controlled via system properties:
+     * <ul>
+     *   <li>{@code sharedmem.force.on.close} (default: {@code true}) – force dirty pages on close.</li>
+     *   <li>{@code sharedmem.flush.every.ops} (default: {@code 0}) – force every N read/write operations.</li>
+     * </ul>
+     * Per-operation force is disabled by default because it is intended only for diagnostics/durability scenarios,
+     * not normal transport throughput.
      * @throws IOException              if the backing file cannot be opened or mapped
      * @throws IllegalArgumentException if {@code capacity} is &le; 0
      * @throws IllegalStateException    if {@code create=false} and the header magic is wrong
      */
     public SharedMemRegion(String regionName, int capacity, boolean create) throws IOException {
+        this(regionName, capacity, create,
+                Boolean.parseBoolean(System.getProperty("sharedmem.force.on.close", "true")),
+                Integer.getInteger("sharedmem.flush.every.ops", 0));
+    }
+
+    SharedMemRegion(String regionName,
+                    int capacity,
+                    boolean create,
+                    boolean forceOnClose,
+                    int flushEveryOps) throws IOException {
         if (capacity <= 0) {
             throw new IllegalArgumentException("capacity must be > 0, got: " + capacity);
         }
+        if (flushEveryOps < 0) {
+            throw new IllegalArgumentException("flushEveryOps must be >= 0, got: " + flushEveryOps);
+        }
         this.regionName = regionName;
         this.capacity   = capacity;
+        this.forceOnClose = forceOnClose;
+        this.flushEveryOps = flushEveryOps;
 
         Path   backingFile = resolveBackingFile(regionName);
         long   totalSize   = (long) HEADER_SIZE + capacity;
@@ -189,14 +226,16 @@ public final class SharedMemRegion implements Closeable {
         int  available   = (int) (writeCursor - readCursor);
         int  toRead      = Math.min(maxLength, available);
         if (toRead <= 0) return 0;
-
+        
+        VarHandle.acquireFence();
         int startPos = (int) (readCursor % capacity);
         for (int i = 0; i < toRead; i++) {
             int index = (startPos + i) % capacity;
             dst[offset + i] = mapping.get(HEADER_SIZE + index);
         }
+        VarHandle.releaseFence();
         writeLong(OFF_READ_CUR, readCursor + toRead);
-        mapping.force();
+        maybeFlush();
         return toRead;
     }
 
@@ -283,7 +322,7 @@ public final class SharedMemRegion implements Closeable {
 
     /**
      * Marks the region as closed (sets {@link #FLAG_CLOSED} in the header),
-     * forces pending writes to the backing file, and releases the file channel.
+     * * optionally forces pending writes to the backing file, and releases the file channel.
      *
      * <p>Idempotent – calling {@code close()} multiple times is safe.
      *
@@ -293,7 +332,9 @@ public final class SharedMemRegion implements Closeable {
     public void close() throws IOException {
         if (closed.compareAndSet(false, true)) {
             writeInt(OFF_FLAGS, readInt(OFF_FLAGS) | FLAG_CLOSED);
-            mapping.force();
+            if (forceOnClose) {
+                mapping.force();
+            }
             fileChannel.close();
         }
     }
@@ -329,6 +370,16 @@ public final class SharedMemRegion implements Closeable {
     private void ensureOpen() {
         if (closed.get()) {
             throw new IllegalStateException("SharedMemRegion '" + regionName + "' is already closed");
+        }
+    }
+    private void maybeFlush() {
+        if (flushEveryOps <= 0) {
+            return;
+        }
+        operationCountSinceFlush++;
+        if (operationCountSinceFlush >= flushEveryOps) {
+            mapping.force();
+            operationCountSinceFlush = 0;
         }
     }
 
