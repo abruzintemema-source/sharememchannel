@@ -7,19 +7,18 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelPipeline;
-import io.netty.channel.sharedmem.SharedMemAddress;
 import io.netty.channel.sharedmem.SharedMemChannel;
 import io.netty.channel.sharedmem.SharedMemChannelOption;
 import io.netty.channel.sharedmem.SharedMemEventLoopGroup;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.codec.LengthFieldPrepender;
-
+import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 
 /**
  * Example SharedMem echo client.
  *
- * <p>Connects to the "echo_server" region, sends "Hello, SharedMem!" and prints
+ * <p>Connects to the localhost:9000, sends "Hello, SharedMem!" and prints
  * the echoed reply.
  *
  * Run with:
@@ -30,8 +29,8 @@ import java.nio.charset.StandardCharsets;
 public final class EchoClient {
 
     private static final int    REGION_SIZE    = 8 * 1024 * 1024;
-    private static final String SERVER_REGION  = "echo_server";
-    private static final String CLIENT_REGION  = "echo_client";
+    private static final String HOST = "localhost";
+    private static final int PORT = 9000;
 
     public static void main(String[] args) throws InterruptedException {
         SharedMemEventLoopGroup group = new SharedMemEventLoopGroup();
@@ -54,11 +53,12 @@ public final class EchoClient {
              });
 
             ChannelFuture f = b.connect(
-                    new SharedMemAddress(SERVER_REGION),
-                    new SharedMemAddress(CLIENT_REGION)
+                    new InetSocketAddress(HOST, PORT),
+                    new InetSocketAddress(HOST, 0)
             ).sync();
 
-            System.out.println("[EchoClient] Connected to sharedmem://" + SERVER_REGION);
+            System.out.println("[EchoClient] Connected to " + HOST + ":" + PORT + " via SharedMemChannel");
+
 
             // Send a test message
             String message = "Hello, SharedMem!";
