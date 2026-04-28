@@ -20,8 +20,8 @@ public abstract class AbstractSharedMemChannel extends AbstractChannel {
     /** Suffix appended to the client data-region name for the server→client ring. */
     static final String S2C_SUFFIX = ".s2c";
 
-    protected volatile SharedMemAddress localAddress;
-    protected volatile SharedMemAddress remoteAddress;
+    protected volatile java.net.SocketAddress localAddress;
+    protected volatile java.net.SocketAddress remoteAddress;
     protected volatile boolean          registered;
     protected volatile boolean          active;
     /** Ring we write into (our outbound direction). */
@@ -40,12 +40,21 @@ public abstract class AbstractSharedMemChannel extends AbstractChannel {
     protected boolean isCompatible(EventLoop loop) {
         return loop instanceof SharedMemEventLoop;
     }
+    @Override
+    protected SocketAddress localAddress0() {
+        return localAddress;
+    }
 
     @Override
-    protected SocketAddress localAddress0()  { return localAddress; }
+    protected SocketAddress remoteAddress0() {
+        return remoteAddress;
+    }
 
-    @Override
-    protected SocketAddress remoteAddress0() { return remoteAddress; }
+    // @Override
+    // protected SocketAddress localAddress0()  { return localAddress; }
+
+    // @Override
+    // protected SocketAddress remoteAddress0() { return remoteAddress; }
 
     @Override
     protected void doRegister() throws Exception {
