@@ -2,8 +2,11 @@ package io.netty.channel.sharedmem;
 
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelOutboundBuffer;
+import io.netty.util.internal.logging.InternalLogger;
+import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.file.Files;
 import java.util.UUID;
@@ -39,10 +42,12 @@ import java.util.UUID;
  *             ch.pipeline().addLast(new MyHandler());
  *         }
  *     });
- * b.connect(new SharedMemAddress("my-service", 9000)).sync();
+ * b.connect(new InetSocketAddress("my-service", 9000)).sync();
  * }</pre>
  */
 public class SharedMemChannel extends AbstractSharedMemChannel {
+    private static final InternalLogger LOG =
+            InternalLoggerFactory.getInstance(SharedMemChannel.class);
 
     private final SharedMemChannelConfig config;
 
@@ -106,23 +111,25 @@ public class SharedMemChannel extends AbstractSharedMemChannel {
      * <p>The server will open this channel's data region from its side when it
      * processes the token in {@link SharedMemServerChannel#pollAccept()}.
      *
-     * @param remoteAddr target server {@link SharedMemAddress}
+     * @param remoteAddr target server {@link InetSocketAddress}
      * @param localAddr  optional local address hint; if null, port 0 is used
      * @throws Exception if the data region or CQ region cannot be accessed
      */
     @Override
     protected void doConnect(SocketAddress remoteAddr, SocketAddress localAddr) throws Exception {
-        java.net.InetSocketAddress remote = (java.net.InetSocketAddress) remoteAddr;
+        if (!(remoteAddr instanceof InetSocketAddress)) {
+            throw new IllegalArgumentException(
+                    "SharedMemChannel requires remoteAddress to be InetSocketAddress, got: "
+                            + (remoteAddr == null ? "null" : remoteAddr.getClass().getName()));
+        }
 
+        InetSocketAddress remote = (InetSocketAddress) remoteAddr;
         String host = remote.getHostString();
-        int port = remote.getPort();
-
-        // 🔥 Map socket → shared memory namespace
-        String serverRegion = host + "_" + port;
+        String serverRegion = SharedMemEndpointKey.endpointKey(remote);
 
         // client id
-        int clientPort = (localAddr instanceof java.net.InetSocketAddress)
-                ? ((java.net.InetSocketAddress) localAddr).getPort()
+        int clientPort = (localAddr instanceof InetSocketAddress)
+                ? ((InetSocketAddress) localAddr).getPort()
                 : 0;
 
         // unique connection region
@@ -131,15 +138,18 @@ public class SharedMemChannel extends AbstractSharedMemChannel {
                 + "_" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
 
         // IMPORTANT: keep original socket addresses for Spark compatibility
-        this.remoteAddress = remote;
-        this.localAddress  = new java.net.InetSocketAddress(host, clientPort);
+        this.remoteAddress = remoteAddr;
+        this.localAddress  = new InetSocketAddress(host, clientPort);
 
         // ── Step 3: create the client→server tx region (client writes) ──────
         int capacity = config.getRegionSize();
         this.txRegion = new SharedMemRegion(uniqueDataRegion, capacity, true);
 
         // ── Step 4: open the server's CQ region and post the token ───────────
-        String cqName = serverRegion + ".cq";
+        String cqName = SharedMemEndpointKey.cqRegionName(remote);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Connecting via server connection queue region: {}", cqName);
+        }
         SharedMemRegion cqRegion = null;
         try {
             cqRegion = new SharedMemRegion(cqName, 1, false);
@@ -162,6 +172,10 @@ public class SharedMemChannel extends AbstractSharedMemChannel {
 
         // ── Step 6: mark active and notify pipeline ───────────────────────────
         this.active = true;
+        if (LOG.isInfoEnabled()) {
+            LOG.info("Connected sharedmem channel local={} remote={} region={}",
+                    localAddress, remoteAddress, uniqueDataRegion);
+        }
         pipeline().fireChannelActive();
     }
 
@@ -209,9 +223,10 @@ public class SharedMemChannel extends AbstractSharedMemChannel {
     private SharedMemRegion waitForS2CRegion(String name, int capacity) throws IOException {
         java.nio.file.Path path = SharedMemRegion.resolveBackingFile(name);
         long deadline = System.nanoTime() + 5_000_000_000L; // 5s
-        System.out.println("🔥 Waiting for S2C region: " + name);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("Waiting for S2C region: {}", name);
+        }
         while (System.nanoTime() < deadline) {
-            System.out.println("🔥 polling S2C...");
             if (Files.exists(path)) {
                 return new SharedMemRegion(name, capacity, false);
             }
@@ -269,5 +284,18 @@ public class SharedMemChannel extends AbstractSharedMemChannel {
 
     public SharedMemRegion getRxRegion() {
         return rxRegion;
+    }
+
+    private static String serverRegionName(SocketAddress remoteAddr) {
+        if (remoteAddr instanceof SharedMemAddress) {
+            return ((SharedMemAddress) remoteAddr).getRegionName();
+        }
+        if (remoteAddr instanceof InetSocketAddress) {
+            InetSocketAddress inet = (InetSocketAddress) remoteAddr;
+            return inet.getHostString() + "_" + inet.getPort();
+        }
+        throw new IllegalArgumentException(
+                "remoteAddr must be InetSocketAddress or SharedMemAddress, got: " +
+                        (remoteAddr == null ? "null" : remoteAddr.getClass().getName()));
     }
 }
