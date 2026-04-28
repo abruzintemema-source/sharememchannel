@@ -24,12 +24,16 @@ class SharedMemRegionTest {
     @BeforeEach
     void setUp() throws IOException {
         System.setProperty("sharedmem.dir", tempDir.toAbsolutePath().toString());
+        System.clearProperty("sharedmem.force.on.close");
+        System.clearProperty("sharedmem.flush.every.ops");
         region = new SharedMemRegion("test_region", 64 * 1024, true);
     }
 
     @AfterEach
     void tearDown() throws IOException {
         if (region != null) region.close();
+        System.clearProperty("sharedmem.force.on.close");
+        System.clearProperty("sharedmem.flush.every.ops");
     }
 
     @Test
@@ -129,12 +133,48 @@ class SharedMemRegionTest {
         byte[] data = "persist".getBytes();
         region.write(data, 0, data.length);
         region.close();
+        region = null;
 
         try (SharedMemRegion reopened = new SharedMemRegion("test_region", 1, false)) {
             assertEquals(data.length, reopened.readableBytes());
             byte[] dst = new byte[data.length];
             reopened.read(dst, 0, dst.length);
             assertArrayEquals(data, dst);
+        }
+    }
+    
+    
+    @Test
+    void testVisibilityAcrossMappingsWithoutPerOpForce() throws IOException {
+        region.close();
+        region = null;
+
+        try (SharedMemRegion writer = new SharedMemRegion("test_region", 64 * 1024, true);
+             SharedMemRegion reader = new SharedMemRegion("test_region", 1, false)) {
+            byte[] data = "mapped-visibility".getBytes();
+
+            assertEquals(data.length, writer.write(data, 0, data.length));
+            assertEquals(data.length, reader.readableBytes());
+
+            byte[] dst = new byte[data.length];
+            assertEquals(data.length, reader.read(dst, 0, dst.length));
+            assertArrayEquals(data, dst);
+        }
+    }
+
+    @Test
+    void testPeriodicFlushCanBeEnabledViaProperty() throws IOException {
+        region.close();
+        region = null;
+        System.setProperty("sharedmem.flush.every.ops", "1");
+
+        try (SharedMemRegion flushy = new SharedMemRegion("flush_region", 4096, true)) {
+            byte[] payload = "abc".getBytes();
+            assertEquals(payload.length, flushy.write(payload, 0, payload.length));
+
+            byte[] dst = new byte[payload.length];
+            assertEquals(payload.length, flushy.read(dst, 0, dst.length));
+            assertArrayEquals(payload, dst);
         }
     }
 }
